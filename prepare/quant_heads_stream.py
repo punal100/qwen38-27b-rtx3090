@@ -32,10 +32,10 @@ import json
 import os
 import struct
 import sys
+import uuid
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
 from compressed_tensors.compressors.pack_quantized.base import pack_to_int32
 
 GROUP = 128
@@ -143,21 +143,33 @@ idx = json.loads(_orig_index)
 wm = idx["weight_map"]
 
 lm_key = "lm_head.weight"
-emb_key = next(k for k in wm if k.endswith("embed_tokens.weight"))
-heads_by_shard = {}
-for key, scale_dtype in ((lm_key, torch.float16), (emb_key, torch.bfloat16)):
-    heads_by_shard.setdefault(wm[key], []).append((key, scale_dtype))
+emb_keys = [k for k in wm if k.endswith("embed_tokens.weight")]
+if lm_key not in wm or len(emb_keys) != 1:
+    raise RuntimeError(f"expected one lm_head and one embed_tokens weight, found lm={lm_key in wm} embed={emb_keys}")
+emb_key = emb_keys[0]
+target_specs = [
+    (lm_key, HEAD_BITS, torch.float16),
+    (emb_key, HEAD_BITS, torch.bfloat16),
+    *((m + ".weight", MTP_BITS, torch.float16) for m in MTP_LINEARS),
+]
+missing = [key for key, _, _ in target_specs if key not in wm]
+if missing:
+    raise RuntimeError(f"missing head/MTP weights: {missing}")
+targets_by_shard = {}
+for key, bits, scale_dtype in target_specs:
+    targets_by_shard.setdefault(wm[key], []).append((key, bits, scale_dtype))
 
-# ---- lm_head + embed_tokens, one streaming pass per source shard ----
-for shard, heads in heads_by_shard.items():
+# ---- heads + MTP, one streaming rewrite per source shard ----
+for shard, targets in targets_by_shard.items():
     add = {}
     with safe_open(d + shard, framework="pt") as f:
-        for key, scale_dtype in heads:
+        for key, bits, scale_dtype in targets:
             w = f.get_tensor(key)
             out_f, in_f = w.shape
-            packed, scale, err = quantize(w, HEAD_BITS)
-            print(f"  {key}: {(out_f, in_f)} int{HEAD_BITS} g{GROUP}, round-trip rel error {err:.4f}")
-            assert err < 0.01, f"quantization error too high for {key}, aborting"
+            packed, scale, err = quantize(w, bits)
+            print(f"  {key}: {(out_f, in_f)} int{bits} g{GROUP}, round-trip rel error {err:.4f}")
+            if err >= 0.01:
+                raise RuntimeError(f"quantization error too high for {key}, aborting")
             base = key[:-len(".weight")]
             add[base + ".weight_packed"] = packed
             # linears take fp16 scales; the embedding path creates them in params_dtype
@@ -166,43 +178,30 @@ for shard, heads in heads_by_shard.items():
             del w, packed, scale
 
     print(f"rewriting {shard} (streaming)")
-    tmp = d + shard + ".tmp"
-    stream_rewrite(d + shard, tmp, drop={key for key, _ in heads}, add=add)
-    os.replace(d + shard, d + shard + ".bak-orig")
+    tmp = d + shard + f".tmp-{uuid.uuid4().hex}"
+    try:
+        stream_rewrite(d + shard, tmp, drop={key for key, _, _ in targets}, add=add)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    backup = d + shard + ".bak-orig"
+    if os.path.lexists(backup):
+        os.unlink(tmp)
+        raise RuntimeError(f"backup already exists: {backup}; restore or archive it before retry")
+    os.replace(d + shard, backup)
     os.replace(tmp, d + shard)
     del add
 
-    for key, _ in heads:
+    for key, _, _ in targets:
         base = key[:-len(".weight")]
         del wm[key]
         for suffix in ("weight_packed", "weight_scale", "weight_shape"):
             wm[f"{base}.{suffix}"] = shard
-
-# ---- MTP module (small shard, fits in RAM) ----
-mtp_shards = {wm[m + ".weight"] for m in MTP_LINEARS}
-assert len(mtp_shards) == 1, f"mtp weights span several shards: {mtp_shards}"
-mtp_shard = mtp_shards.pop()
-print(f"mtp linears live in {mtp_shard}, quantizing to int{MTP_BITS} g{GROUP}")
-
-tensors = {}
-with safe_open(d + mtp_shard, framework="pt") as f:
-    mtp_meta = f.metadata()
-    for k in f.keys():
-        tensors[k] = f.get_tensor(k)
-for m in MTP_LINEARS:
-    w = tensors.pop(m + ".weight")
-    out_f, in_f = w.shape
-    packed, scale, err = quantize(w, MTP_BITS)
-    print(f"  {m}: {(out_f, in_f)} round-trip rel error {err:.4f}")
-    tensors[m + ".weight_packed"] = packed
-    tensors[m + ".weight_scale"] = scale.to(torch.float16)
-    tensors[m + ".weight_shape"] = torch.tensor([out_f, in_f], dtype=torch.int64)
-    del wm[m + ".weight"]
-    for s in ("weight_packed", "weight_scale", "weight_shape"):
-        wm[f"{m}.{s}"] = mtp_shard
-os.replace(d + mtp_shard, d + mtp_shard + ".bak-orig")
-save_file(tensors, d + mtp_shard, metadata=mtp_meta or {"format": "pt"})
-del tensors
 
 json.dump(idx, open(idx_path, "w"), indent=2)
 
