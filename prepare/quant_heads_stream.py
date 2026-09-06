@@ -144,37 +144,39 @@ wm = idx["weight_map"]
 
 lm_key = "lm_head.weight"
 emb_key = next(k for k in wm if k.endswith("embed_tokens.weight"))
-big = wm[lm_key]
-assert wm[emb_key] == big, "lm_head and embed_tokens live in different shards"
+heads_by_shard = {}
+for key, scale_dtype in ((lm_key, torch.float16), (emb_key, torch.bfloat16)):
+    heads_by_shard.setdefault(wm[key], []).append((key, scale_dtype))
 
-# ---- lm_head + embed_tokens, one streaming pass over the big shard ----
-add = {}
-with safe_open(d + big, framework="pt") as f:
-    for key, scale_dtype in ((lm_key, torch.float16), (emb_key, torch.bfloat16)):
-        w = f.get_tensor(key)
-        out_f, in_f = w.shape
-        packed, scale, err = quantize(w, HEAD_BITS)
-        print(f"  {key}: {(out_f, in_f)} int{HEAD_BITS} g{GROUP}, round-trip rel error {err:.4f}")
-        assert err < 0.01, f"quantization error too high for {key}, aborting"
+# ---- lm_head + embed_tokens, one streaming pass per source shard ----
+for shard, heads in heads_by_shard.items():
+    add = {}
+    with safe_open(d + shard, framework="pt") as f:
+        for key, scale_dtype in heads:
+            w = f.get_tensor(key)
+            out_f, in_f = w.shape
+            packed, scale, err = quantize(w, HEAD_BITS)
+            print(f"  {key}: {(out_f, in_f)} int{HEAD_BITS} g{GROUP}, round-trip rel error {err:.4f}")
+            assert err < 0.01, f"quantization error too high for {key}, aborting"
+            base = key[:-len(".weight")]
+            add[base + ".weight_packed"] = packed
+            # linears take fp16 scales; the embedding path creates them in params_dtype
+            add[base + ".weight_scale"] = scale.to(scale_dtype)
+            add[base + ".weight_shape"] = torch.tensor([out_f, in_f], dtype=torch.int64)
+            del w, packed, scale
+
+    print(f"rewriting {shard} (streaming)")
+    tmp = d + shard + ".tmp"
+    stream_rewrite(d + shard, tmp, drop={key for key, _ in heads}, add=add)
+    os.replace(d + shard, d + shard + ".bak-orig")
+    os.replace(tmp, d + shard)
+    del add
+
+    for key, _ in heads:
         base = key[:-len(".weight")]
-        add[base + ".weight_packed"] = packed
-        # linears take fp16 scales; the embedding path creates them in params_dtype
-        add[base + ".weight_scale"] = scale.to(scale_dtype)
-        add[base + ".weight_shape"] = torch.tensor([out_f, in_f], dtype=torch.int64)
-        del w, packed, scale
-
-print(f"rewriting {big} (streaming)")
-tmp = d + big + ".tmp"
-stream_rewrite(d + big, tmp, drop={lm_key, emb_key}, add=add)
-os.replace(d + big, d + big + ".bak-orig")
-os.replace(tmp, d + big)
-del add
-
-for key in (lm_key, emb_key):
-    base = key[:-len(".weight")]
-    del wm[key]
-    for s in ("weight_packed", "weight_scale", "weight_shape"):
-        wm[f"{base}.{s}"] = big
+        del wm[key]
+        for suffix in ("weight_packed", "weight_scale", "weight_shape"):
+            wm[f"{base}.{suffix}"] = shard
 
 # ---- MTP module (small shard, fits in RAM) ----
 mtp_shards = {wm[m + ".weight"] for m in MTP_LINEARS}
