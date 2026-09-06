@@ -22,10 +22,75 @@ The shipped draft_vocab_ids.json was counted over Danish web text (fineweb-2),
 English Wikipedia, Python source and the model's own chat outputs (8.8M tokens);
 held-out coverage 95%.
 """
-import glob, json, os, sys, shutil, collections
+import glob, json, os, sys, shutil, collections, uuid
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+
+def fsync_dir(path):
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path, obj):
+    tmp = path + f".tmp-{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "x", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_torch(path, obj):
+    tmp = path + f".tmp-{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "xb") as f:
+            torch.save(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_backup(src, backup):
+    if os.path.lexists(backup):
+        if os.path.islink(backup) or not os.path.isfile(backup):
+            raise RuntimeError(f"unsafe draft backup path: {backup}")
+        return
+    tmp = backup + f".tmp-{uuid.uuid4().hex}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(src, "rb") as source, os.fdopen(fd, "wb") as dest:
+            shutil.copyfileobj(source, dest)
+            dest.flush()
+            os.fsync(dest.fileno())
+        try:
+            os.link(tmp, backup)
+        except FileExistsError:
+            if os.path.islink(backup) or not os.path.isfile(backup):
+                raise RuntimeError(f"unsafe draft backup path: {backup}")
+        fsync_dir(backup)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 d = sys.argv[1].rstrip("/") + "/"
 N = int(sys.argv[sys.argv.index("--n") + 1]) if "--n" in sys.argv else 40960
@@ -85,7 +150,7 @@ if not ids_file:
         s = set(t for t, _ in counts.most_common(n_try)) | special
         c = sum(c for t, c in held.items() if t in s) / max(1, sum(held.values()))
         print(f"  coverage at N={n_try}: {c*100:.2f}%")
-    json.dump(ids, open(d + "draft_vocab_ids.json", "w"))
+    atomic_json(d + "draft_vocab_ids.json", ids)
     print(f"id list written to {d}draft_vocab_ids.json (copy it next to this script to reuse)")
 
 # slice lm_head rows
@@ -109,19 +174,84 @@ extra = "model_extra_tensors.safetensors"
 # file at all (#37) -- the draft head becomes its first content.
 tensors = {}
 meta = None
-if os.path.exists(d + extra):
-    with safe_open(d + extra, framework="pt") as f:
+extra_path = d + extra
+draft_keys = {
+    "mtp.draft_lm_head.weight_packed",
+    "mtp.draft_lm_head.weight_scale",
+    "mtp.draft_lm_head.weight_shape",
+}
+expected_mtp = {
+    key for key, shard in wm.items()
+    if shard == extra and key.startswith("mtp.") and key not in draft_keys
+}
+indexed_extra = {key for key, shard in wm.items() if shard == extra}
+indexed_draft = indexed_extra & draft_keys
+if indexed_draft not in (set(), draft_keys):
+    raise RuntimeError(f"index has incomplete draft-head inventory: {sorted(indexed_draft)}")
+existing_keys = set()
+if os.path.exists(extra_path):
+    with safe_open(extra_path, framework="pt") as f:
         meta = f.metadata()
-        for k in f.keys():
+        existing_keys = set(f.keys())
+        missing = expected_mtp - existing_keys
+        if missing:
+            raise RuntimeError(f"existing extra shard is missing indexed MTP tensors: {sorted(missing)}")
+        allowed = {frozenset(indexed_extra)}
+        if not indexed_draft:
+            allowed.add(frozenset(indexed_extra | draft_keys))
+        if frozenset(existing_keys) not in allowed:
+            raise RuntimeError("existing extra shard does not match index inventory")
+        for k in existing_keys:
             tensors[k] = f.get_tensor(k)
-    if not os.path.exists(d + extra + ".bak-draft"):
-        shutil.copy(d + extra, d + extra + ".bak-draft")
+    backup_path = extra_path + ".bak-draft"
+    expected_backup = indexed_extra - draft_keys
+    if expected_backup:
+        ensure_backup(extra_path, backup_path)
+        try:
+            with safe_open(backup_path, framework="pt") as f:
+                backup_keys = set(f.keys())
+        except Exception as exc:
+            raise RuntimeError(f"draft backup is unreadable: {backup_path}") from exc
+        if backup_keys != expected_backup:
+            raise RuntimeError(f"draft backup inventory mismatch: {backup_path}")
+    elif os.path.lexists(backup_path):
+        if os.path.islink(backup_path) or not os.path.isfile(backup_path):
+            raise RuntimeError(f"unsafe draft backup path: {backup_path}")
+        try:
+            with safe_open(backup_path, framework="pt") as f:
+                if set(f.keys()) != draft_keys:
+                    raise RuntimeError(f"draft backup inventory mismatch: {backup_path}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"draft backup is unreadable: {backup_path}") from exc
+elif expected_mtp:
+    raise RuntimeError(f"extra shard is absent but index expects MTP tensors: {sorted(expected_mtp)}")
 tensors["mtp.draft_lm_head.weight_packed"] = sub_p
 tensors["mtp.draft_lm_head.weight_scale"] = sub_s
 tensors["mtp.draft_lm_head.weight_shape"] = sub_shape
-save_file(tensors, d + extra, metadata=meta or {"format": "pt"})
+tmp = extra_path + f".tmp-{uuid.uuid4().hex}"
+try:
+    save_file(tensors, tmp, metadata=meta or {"format": "pt"})
+    with safe_open(tmp, framework="pt") as f:
+        written_keys = set(f.keys())
+    required_keys = existing_keys | draft_keys
+    if written_keys != required_keys or not expected_mtp <= written_keys:
+        raise RuntimeError(
+            "draft extra shard inventory mismatch: "
+            f"missing={sorted(required_keys - written_keys)} extra={sorted(written_keys - required_keys)}"
+        )
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())
+    os.replace(tmp, extra_path)
+    fsync_dir(extra_path)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
 for s in ("weight_packed", "weight_scale", "weight_shape"):
     wm[f"mtp.draft_lm_head.{s}"] = extra
-json.dump(idx, open(d + "model.safetensors.index.json", "w"), indent=2)
-torch.save(ids_t, d + "mtp_draft_vocab_ids.pt")
+atomic_torch(d + "mtp_draft_vocab_ids.pt", ids_t)
+atomic_json(d + "model.safetensors.index.json", idx)
 print("done")
