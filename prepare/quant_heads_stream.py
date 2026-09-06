@@ -80,13 +80,78 @@ def quantize(w, bits):
         packed_parts.append(pack_to_int32(q.reshape(chunk.shape[0], in_f), bits, packed_dim=1).contiguous())
         scale_parts.append(s.squeeze(-1).contiguous())
         del chunk, g, q, deq
-    return torch.cat(packed_parts), torch.cat(scale_parts), (num / den) ** 0.5
+    err = 0.0 if den == 0.0 and num == 0.0 else (num / den) ** 0.5
+    return torch.cat(packed_parts), torch.cat(scale_parts), err
+
+
+def files_equal(a, b):
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(64 << 20), fb.read(64 << 20)
+            if ca != cb:
+                return False
+            if not ca:
+                return True
+
+
+def fsync_dir(path):
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def ensure_backup(path, data):
+    backup = path + ".bak-quant"
+    if os.path.lexists(backup):
+        if os.path.islink(backup) or not os.path.isfile(backup):
+            raise RuntimeError(f"unsafe backup path: {backup}")
+        with open(backup, "rb") as f:
+            saved = f.read()
+        if saved != data:
+            raise RuntimeError(f"existing backup differs from restored {path}: {backup}")
+        return
+    with open(backup, "xb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    fsync_dir(backup)
+
+
+def atomic_json(path, obj):
+    tmp = path + f".tmp-{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "x") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def read_header(path):
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(n))
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                raise ValueError("missing safetensors header length")
+            n = struct.unpack("<Q", raw)[0]
+            if n == 0 or n > min(256 << 20, size - 8):
+                raise ValueError(f"invalid safetensors header length {n}")
+            hdr = json.loads(f.read(n))
+            if not isinstance(hdr, dict):
+                raise ValueError("safetensors header is not an object")
+    except (OSError, ValueError, json.JSONDecodeError, struct.error) as exc:
+        raise RuntimeError(f"cannot read safetensors header {path}: {exc}") from exc
     return hdr, 8 + n
 
 
@@ -137,9 +202,15 @@ def stream_rewrite(src, dst, drop, add):
 
 
 idx_path = d + "model.safetensors.index.json"
-_orig_index = open(idx_path, "rb").read()
-open(idx_path + ".bak-quant", "wb").write(_orig_index)
+cfg_path = d + "config.json"
+with open(idx_path, "rb") as f:
+    _orig_index = f.read()
+with open(cfg_path, "rb") as f:
+    _orig_config = f.read()
 idx = json.loads(_orig_index)
+c = json.loads(_orig_config)
+ensure_backup(idx_path, _orig_index)
+ensure_backup(cfg_path, _orig_config)
 wm = idx["weight_map"]
 
 lm_key = "lm_head.weight"
@@ -191,10 +262,14 @@ for shard, targets in targets_by_shard.items():
         raise
     backup = d + shard + ".bak-orig"
     if os.path.lexists(backup):
-        os.unlink(tmp)
-        raise RuntimeError(f"backup already exists: {backup}; restore or archive it before retry")
-    os.replace(d + shard, backup)
+        if os.path.islink(backup) or not os.path.isfile(backup) or not files_equal(d + shard, backup):
+            os.unlink(tmp)
+            raise RuntimeError(f"existing backup differs from restored shard {shard}: {backup}")
+    else:
+        os.replace(d + shard, backup)
+        fsync_dir(backup)
     os.replace(tmp, d + shard)
+    fsync_dir(d + shard)
     del add
 
     for key, _, _ in targets:
@@ -203,12 +278,9 @@ for shard, targets in targets_by_shard.items():
         for suffix in ("weight_packed", "weight_scale", "weight_shape"):
             wm[f"{base}.{suffix}"] = shard
 
-json.dump(idx, open(idx_path, "w"), indent=2)
+atomic_json(idx_path, idx)
 
 # ---- config.json ----
-cfg_path = d + "config.json"
-c = json.load(open(cfg_path))
-json.dump(c, open(cfg_path + ".bak-quant", "w"), indent=2)
 qc = c["quantization_config"]
 
 
@@ -233,5 +305,5 @@ qc["config_groups"]["group_2"] = group(HEAD_BITS, ["re:.*embed_tokens$"])
 qc["config_groups"]["group_3"] = group(
     MTP_BITS, ["re:^mtp\\.layers\\..*"] if KEEP_FC else ["re:^mtp\\..*"]
 )
-json.dump(c, open(cfg_path, "w"), indent=2)
+atomic_json(cfg_path, c)
 print("done")
